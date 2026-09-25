@@ -13,7 +13,18 @@ import db
 # from the service's environment variables / secrets instead.
 load_dotenv()
 
-TEST_GUILD = discord.Object(id=int(os.getenv('TEST_GUILD_ID')))
+# Where slash commands are registered on startup:
+#   guild  - only in the TEST_GUILD_ID server. Updates show up instantly,
+#            so use this while developing.
+#   global - in every server the bot is in, and in DMs with the bot.
+COMMAND_SYNC = os.getenv("COMMAND_SYNC", "guild").strip().lower()
+if COMMAND_SYNC not in ("guild", "global"):
+    raise RuntimeError(f"COMMAND_SYNC must be 'guild' or 'global', not {COMMAND_SYNC!r}")
+
+_test_guild_id = os.getenv("TEST_GUILD_ID")
+if COMMAND_SYNC == "guild" and not _test_guild_id:
+    raise RuntimeError("COMMAND_SYNC=guild needs TEST_GUILD_ID set to your test server's ID")
+TEST_GUILD = discord.Object(id=int(_test_guild_id)) if _test_guild_id else None
 
 # Every cog module listed here gets loaded on startup.
 # Add a new entry whenever you create a new file in cogs/.
@@ -50,6 +61,30 @@ class Client(commands.Bot):
         for extension in INITIAL_EXTENSIONS:
             await self.load_extension(extension)
 
+        # Here rather than on_ready, which fires again on every reconnect -
+        # no need to re-register commands each time (Discord rate-limits it).
+        await self._sync_commands()
+
+    async def _sync_commands(self):
+        if COMMAND_SYNC == "guild":
+            # Copy the global commands into the test server so they show up
+            # instantly. Global registrations are left alone, so a globally
+            # synced deployment of this bot (e.g. on Cloud Run) keeps its
+            # commands everywhere while you test locally.
+            self.tree.copy_global_to(guild=TEST_GUILD)
+            synced = await self.tree.sync(guild=TEST_GUILD)
+            print(f"Synced {len(synced)} command(s) to test server {TEST_GUILD.id}")
+            return
+
+        synced = await self.tree.sync()
+        print(f"Synced {len(synced)} command(s) globally")
+        if TEST_GUILD is not None:
+            # Remove any copies left in the test server from guild mode, or
+            # every command would show up there twice.
+            self.tree.clear_commands(guild=TEST_GUILD)
+            await self.tree.sync(guild=TEST_GUILD)
+            print(f"Cleared guild-only command copies from test server {TEST_GUILD.id}")
+
     async def _start_health_server(self, port: int):
         async def health(request: web.Request) -> web.Response:
             return web.Response(text="ok" if self.is_ready() else "starting")
@@ -69,11 +104,6 @@ class Client(commands.Bot):
 
     async def on_ready(self):
         print(f'Connected as {self.user}')
-        # Copy the global commands into your test server so they show up
-        # instantly, instead of waiting up to an hour for the global sync.
-        self.tree.copy_global_to(guild=TEST_GUILD)
-        synced = await self.tree.sync(guild=TEST_GUILD)
-        print(f'Synced {len(synced)} command(s) to test server')
 
 
 intents = discord.Intents.default()
