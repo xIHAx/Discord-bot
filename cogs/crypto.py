@@ -97,13 +97,13 @@ class Crypto(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.api_key = os.getenv("CMC_API_KEY")
+        self.api_key = os.getenv("CMC_API")
         self._session: Optional[aiohttp.ClientSession] = None
         self._notify_semaphore: Optional[asyncio.Semaphore] = None
 
     async def cog_load(self):
         if not self.api_key:
-            print("CMC_API_KEY is not set - crypto commands will not be able to fetch prices")
+            print("CMC_API is not set - crypto commands will not be able to fetch prices")
         await db.ensure_index(COLLECTION, [("user_id", 1)])
         await db.ensure_index(COLLECTION, [("notify", 1), ("next_send_utc", 1)])
         self._session = aiohttp.ClientSession()
@@ -124,7 +124,7 @@ class Crypto(commands.Cog):
         absent. Raises CoinMarketCapError if the request itself fails.
         """
         if not self.api_key:
-            raise CoinMarketCapError("CMC_API_KEY is not set")
+            raise CoinMarketCapError("CMC_API is not set")
         if not symbols:
             return {}
 
