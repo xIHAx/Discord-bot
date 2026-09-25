@@ -73,6 +73,16 @@ def prices_embed(title: str, coins: List[str], quotes: Dict[str, dict], footer: 
     return embed
 
 
+def daily_prices_embed(coins: List[str], quotes: Dict[str, dict]) -> discord.Embed:
+    """The daily price DM - also what /coinlist sends on demand."""
+    return prices_embed(
+        "Your daily crypto prices",
+        coins,
+        quotes,
+        footer="Data from CoinMarketCap · /togglenotif to stop these DMs",
+    )
+
+
 class CoinMarketCapError(Exception):
     pass
 
@@ -281,7 +291,7 @@ class Crypto(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="coinlist", description="Show the coins on your watchlist and their current prices")
+    @app_commands.command(name="coinlist", description="DM yourself your watchlist's current prices, like the daily message")
     async def coinlist(self, interaction: discord.Interaction):
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id})
         coins = doc.get("coins", []) if doc else []
@@ -302,14 +312,16 @@ class Crypto(commands.Cog):
             )
             return
 
-        notif = "on" if doc.get("notify") else "off"
-        embed = prices_embed(
-            "Your crypto watchlist",
-            coins,
-            quotes,
-            footer=f"Data from CoinMarketCap · Daily DMs are {notif} (/togglenotif)",
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        try:
+            await interaction.user.send(embed=daily_prices_embed(coins, quotes))
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I couldn't DM you - allow direct messages from server members in your privacy settings and try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("Sent your coin prices to your DMs.", ephemeral=True)
 
     @app_commands.command(name="togglenotif", description="Turn your daily crypto price DMs on or off")
     async def togglenotif(self, interaction: discord.Interaction):
@@ -401,15 +413,8 @@ class Crypto(commands.Cog):
         except discord.NotFound:
             return
 
-        embed = prices_embed(
-            "Your daily crypto prices",
-            doc["coins"],
-            quotes,
-            footer="Data from CoinMarketCap · /togglenotif to stop these DMs",
-        )
-
         try:
-            await user.send(embed=embed)
+            await user.send(embed=daily_prices_embed(doc["coins"], quotes))
         except discord.Forbidden:
             pass
 
