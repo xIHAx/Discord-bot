@@ -17,6 +17,7 @@ INITIAL_EXTENSIONS = [
     "cogs.voice",
     "cogs.data",
     "cogs.calendar",
+    "cogs.crypto",
 ]
 
 

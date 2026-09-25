@@ -9,9 +9,10 @@ using any of the other functions here.
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorGridFSBucket
+from pymongo import UpdateOne
 
 _client: Optional[AsyncIOMotorClient] = None
 _db: Optional[AsyncIOMotorDatabase] = None
@@ -139,3 +140,14 @@ async def bulk_set(collection_name: str, ids: List[Any], update: Dict[str, Any])
     if not ids:
         return
     await _db[collection_name].update_many({"_id": {"$in": ids}}, {"$set": update})
+
+
+async def bulk_update(collection_name: str, updates: List[Tuple[Any, Dict[str, Any]]]) -> None:
+    """Set (possibly different) fields on many documents in a single round
+    trip. `updates` is a list of (_id, fields_to_set) pairs."""
+    if not updates:
+        return
+    await _db[collection_name].bulk_write(
+        [UpdateOne({"_id": _id}, {"$set": fields}) for _id, fields in updates],
+        ordered=False,
+    )
