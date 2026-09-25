@@ -52,6 +52,27 @@ def format_price(price: float) -> str:
     return "$" + (digits if len(digits.split(".")[1]) >= 2 else f"{price:.2f}")
 
 
+def prices_embed(title: str, coins: List[str], quotes: Dict[str, dict], footer: str) -> discord.Embed:
+    """One inline field per coin: price and 24h change, in watchlist order."""
+    embed = discord.Embed(title=title, colour=discord.Colour.gold())
+    for symbol in coins:
+        coin = quotes.get(symbol)
+        if coin is None:
+            embed.add_field(name=symbol, value="No data available", inline=True)
+            continue
+        usd = coin["quote"]["USD"]
+        change = usd.get("percent_change_24h") or 0
+        arrow = "🟢" if change >= 0 else "🔴"
+        embed.add_field(
+            name=f"{symbol} · {coin['name']}",
+            value=f"**{format_price(usd['price'])}**\n{arrow} {change:+.2f}% (24h)",
+            inline=True,
+        )
+    embed.set_footer(text=footer)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
 class CoinMarketCapError(Exception):
     pass
 
@@ -234,6 +255,36 @@ class Crypto(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(name="coinlist", description="Show the coins on your watchlist and their current prices")
+    async def coinlist(self, interaction: discord.Interaction):
+        doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id})
+        coins = doc.get("coins", []) if doc else []
+
+        if not coins:
+            await interaction.response.send_message("Your watchlist is empty - add coins with /addcoin.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            quotes = await self.fetch_quotes(coins)
+        except CoinMarketCapError as e:
+            print(f"CoinMarketCap lookup for /coinlist failed: {e}")
+            await interaction.followup.send(
+                f"Couldn't reach CoinMarketCap right now. Your coins: {', '.join(coins)}",
+                ephemeral=True,
+            )
+            return
+
+        notif = "on" if doc.get("notify") else "off"
+        embed = prices_embed(
+            "Your crypto watchlist",
+            coins,
+            quotes,
+            footer=f"Data from CoinMarketCap · Daily DMs are {notif} (/togglenotif)",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     @app_commands.command(name="togglenotif", description="Turn your daily crypto price DMs on or off")
     async def togglenotif(self, interaction: discord.Interaction):
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id})
@@ -324,22 +375,12 @@ class Crypto(commands.Cog):
         except discord.NotFound:
             return
 
-        embed = discord.Embed(title="Your daily crypto prices", colour=discord.Colour.gold())
-        for symbol in doc["coins"]:
-            coin = quotes.get(symbol)
-            if coin is None:
-                embed.add_field(name=symbol, value="No data available", inline=True)
-                continue
-            usd = coin["quote"]["USD"]
-            change = usd.get("percent_change_24h") or 0
-            arrow = "🟢" if change >= 0 else "🔴"
-            embed.add_field(
-                name=f"{symbol} · {coin['name']}",
-                value=f"**{format_price(usd['price'])}**\n{arrow} {change:+.2f}% (24h)",
-                inline=True,
-            )
-        embed.set_footer(text="Data from CoinMarketCap · /togglenotif to stop these DMs")
-        embed.timestamp = datetime.now(timezone.utc)
+        embed = prices_embed(
+            "Your daily crypto prices",
+            doc["coins"],
+            quotes,
+            footer="Data from CoinMarketCap · /togglenotif to stop these DMs",
+        )
 
         try:
             await user.send(embed=embed)
