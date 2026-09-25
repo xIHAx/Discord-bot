@@ -118,10 +118,18 @@ class SnoozeButton(
             )
             return
 
-        # Re-arm the reminder; check_events() will send it again at the new time.
-        await db.update_document("events", {"_id": event["_id"]}, {"remind_time_utc": snooze_until, "reminder_sent": False})
+        # Re-arm the reminder; check_events() will send it again at the new
+        # time. The snoozed reminder replaces the "It's time!" DM, so mute
+        # that - the event is still marked sent at its start time (see
+        # _notify), so it moves to /pastevents as usual.
+        await db.update_document(
+            "events",
+            {"_id": event["_id"]},
+            {"remind_time_utc": snooze_until, "reminder_sent": False, "start_notification_muted": True},
+        )
         await interaction.response.edit_message(
-            content=f"{interaction.message.content}\n💤 Snoozed - I'll remind you again <t:{int(snooze_until.timestamp())}:R>.",
+            content=f"{interaction.message.content}\n💤 Snoozed - I'll remind you again <t:{int(snooze_until.timestamp())}:R>. "
+            "You won't get a separate message when it starts.",
             view=None,
         )
 
@@ -205,20 +213,20 @@ class Calendar(commands.Cog):
 
     @app_commands.command(name="createevent", description="Create an event with a reminder")
     @app_commands.describe(
+        date="Date as YYYY-MM-DD, e.g. 2026-10-03",
         time="24-hour time, e.g. 14:30",
         title="Event title",
         description="Event description",
         remind_before_hours="How many hours before the event to remind you. Decimals allowed, e.g. 1.5. Use 0 for no separate reminder.",
-        date="Optional date as YYYY-MM-DD. Defaults to today, or tomorrow if that time has already passed today.",
     )
     async def createevent(
         self,
         interaction: discord.Interaction,
+        date: str,
         time: str,
         title: str,
         description: str,
         remind_before_hours: float,
-        date: Optional[str] = None,
     ):
         settings = await db.find_one("user_settings", {"user_id": interaction.user.id})
         if settings is None:
@@ -242,19 +250,16 @@ class Calendar(commands.Cog):
             return
 
         user_tz = timezone(timedelta(hours=settings["utc_offset"]))
-        now_local = datetime.now(user_tz)
+        try:
+            y, m, d = (int(part) for part in date.strip().split("-"))
+            event_local = datetime(y, m, d, hour, minute, tzinfo=user_tz)
+        except ValueError:
+            await interaction.response.send_message("Date must be a real date as YYYY-MM-DD, e.g. 2026-10-03.", ephemeral=True)
+            return
 
-        if date:
-            try:
-                y, m, d = (int(part) for part in date.split("-"))
-                event_local = datetime(y, m, d, hour, minute, tzinfo=user_tz)
-            except ValueError:
-                await interaction.response.send_message("Date must be YYYY-MM-DD.", ephemeral=True)
-                return
-        else:
-            event_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if event_local <= now_local:
-                event_local += timedelta(days=1)
+        if event_local <= datetime.now(user_tz):
+            await interaction.response.send_message("That date and time has already passed.", ephemeral=True)
+            return
 
         event_time_utc = event_local.astimezone(timezone.utc)
         remind_time_utc = event_time_utc - timedelta(hours=remind_before_hours)
@@ -397,6 +402,10 @@ class Calendar(commands.Cog):
             await self._notify(event, is_reminder)
 
     async def _notify(self, event: dict, is_reminder: bool):
+        if not is_reminder and event.get("start_notification_muted"):
+            # The user snoozed this event's reminder - that replaces the start DM.
+            return
+
         try:
             user = self.bot.get_user(event["user_id"]) or await self.bot.fetch_user(event["user_id"])
         except discord.NotFound:
