@@ -1,0 +1,11 @@
+# Never bake secrets into the image - on Cloud Run they come from Secret Manager.
+.env
+
+.git
+.gitignore
+.gitattributes
+.vscode
+__pycache__/
+*.pyc
+Dockerfile
+.dockerignore
