@@ -1,3 +1,5 @@
-discord.py
-python-dotenv
-motor
+discord.py~=2.7.1
+python-dotenv~=1.2.1
+motor~=3.7.1
+aiohttp~=3.13.5
+yfinance~=1.2.0

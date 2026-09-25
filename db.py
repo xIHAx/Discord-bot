@@ -1,26 +1,26 @@
 """
-MongoDB access for the bot: file storage (GridFS) plus plain JSON documents.
+MongoDB access for the bot, storing plain JSON documents.
 
 Uses Motor (the async MongoDB driver) so calls don't block the bot's event
-loop, and GridFS so files aren't limited by MongoDB's 16MB document cap.
+loop.
 
 Call init_db() once, early in startup (see main.py's setup_hook), before
 using any of the other functions here.
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorGridFSBucket
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import UpdateOne
 
 _client: Optional[AsyncIOMotorClient] = None
 _db: Optional[AsyncIOMotorDatabase] = None
-_fs: Optional[AsyncIOMotorGridFSBucket] = None
 
 
 def init_db() -> AsyncIOMotorClient:
     """Connect to MongoDB using MONGO_URI from the environment (.env)."""
-    global _client, _db, _fs
+    global _client, _db
 
     uri = os.getenv("MONGO_URI")
     if not uri:
@@ -30,7 +30,6 @@ def init_db() -> AsyncIOMotorClient:
 
     _client = AsyncIOMotorClient(uri)
     _db = _client[db_name]
-    _fs = AsyncIOMotorGridFSBucket(_db)
     return _client
 
 
@@ -39,66 +38,10 @@ def close_db():
         _client.close()
 
 
-async def upload_file(local_path: str, filename: Optional[str] = None) -> str:
-    """Upload a local file into MongoDB. Returns the new file's id as a string."""
-    filename = filename or os.path.basename(local_path)
-    with open(local_path, "rb") as f:
-        data = f.read()
-    file_id = await _fs.upload_from_stream(filename, data)
-    return str(file_id)
-
-
-async def download_file(filename: str, save_path: str) -> bool:
-    """
-    Fetch the most recently uploaded version of `filename` from MongoDB and
-    write it to save_path. Returns False if no file with that name exists.
-    """
-    cursor = _fs.find({"filename": filename}).sort("uploadDate", -1).limit(1)
-    docs = await cursor.to_list(length=1)
-    if not docs:
-        return False
-
-    stream = await _fs.open_download_stream(docs[0]._id)
-    data = await stream.read()
-
-    with open(save_path, "wb") as f:
-        f.write(data)
-    return True
-
-
-async def list_files() -> List[str]:
-    """Return the filenames of everything currently stored."""
-    cursor = _fs.find()
-    docs = await cursor.to_list(length=None)
-    return [doc.filename for doc in docs]
-
-
-async def delete_file(filename: str) -> bool:
-    """Delete every stored version of `filename`. Returns False if none existed."""
-    cursor = _fs.find({"filename": filename})
-    docs = await cursor.to_list(length=None)
-    if not docs:
-        return False
-    for doc in docs:
-        await _fs.delete(doc._id)
-    return True
-
-
-# --- Plain JSON documents (not files) -------------------------------------
-# Use these when you want to store structured data - dicts of strings,
-# numbers, etc. - as their own MongoDB documents in a normal collection,
-# rather than as a GridFS file.
-
 async def insert_document(collection_name: str, document: Dict[str, Any]) -> str:
     """Insert a dict as a new document in `collection_name`. Returns its _id as a string."""
     result = await _db[collection_name].insert_one(document)
     return str(result.inserted_id)
-
-
-async def find_documents(collection_name: str, query: Optional[Dict[str, Any]] = None, limit: int = 100) -> List[Dict[str, Any]]:
-    """Return up to `limit` documents from `collection_name` matching `query` (default: all)."""
-    cursor = _db[collection_name].find(query or {}).limit(limit)
-    return await cursor.to_list(length=limit)
 
 
 async def find_one(collection_name: str, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -122,15 +65,24 @@ async def ensure_index(collection_name: str, keys) -> None:
     await _db[collection_name].create_index(keys)
 
 
-def iter_documents(collection_name: str, query: Dict[str, Any], batch_size: int = 500):
+def iter_documents(collection_name: str, query: Dict[str, Any], batch_size: int = 500, sort=None):
     """
     Return a cursor over every document matching `query`, fetched from Mongo
-    in batches of `batch_size` rather than being loaded all at once. Use this
-    instead of find_documents() whenever the result set could be large (e.g.
-    "everything due right now" across many users) - iterate it with
-    `async for doc in cursor`.
+    in batches of `batch_size` rather than being loaded all at once, so large
+    result sets (e.g. "everything due right now" across many users) don't
+    spike memory - iterate it with `async for doc in cursor`. `sort` is
+    whatever cursor.sort() accepts, e.g. [("event_time_utc", 1)].
     """
-    return _db[collection_name].find(query).batch_size(batch_size)
+    cursor = _db[collection_name].find(query)
+    if sort:
+        cursor = cursor.sort(sort)
+    return cursor.batch_size(batch_size)
+
+
+async def delete_documents(collection_name: str, query: Dict[str, Any]) -> int:
+    """Delete every document matching `query`. Returns how many were deleted."""
+    result = await _db[collection_name].delete_many(query)
+    return result.deleted_count
 
 
 async def bulk_set(collection_name: str, ids: List[Any], update: Dict[str, Any]) -> None:
@@ -139,3 +91,14 @@ async def bulk_set(collection_name: str, ids: List[Any], update: Dict[str, Any])
     if not ids:
         return
     await _db[collection_name].update_many({"_id": {"$in": ids}}, {"$set": update})
+
+
+async def bulk_update(collection_name: str, updates: List[Tuple[Any, Dict[str, Any]]]) -> None:
+    """Set (possibly different) fields on many documents in a single round
+    trip. `updates` is a list of (_id, fields_to_set) pairs."""
+    if not updates:
+        return
+    await _db[collection_name].bulk_write(
+        [UpdateOne({"_id": _id}, {"$set": fields}) for _id, fields in updates],
+        ordered=False,
+    )
