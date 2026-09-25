@@ -63,7 +63,7 @@ class Calendar(commands.Cog):
         sign = "+" if utc_offset >= 0 else ""
         await interaction.response.send_message(f"Timezone set to UTC{sign}{utc_offset}.", ephemeral=True)
 
-    # ------------------------------------------------------------------ events
+    # events
 
     @app_commands.command(name="createevent", description="Create an event with a reminder")
     @app_commands.describe(
