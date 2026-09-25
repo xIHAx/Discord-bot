@@ -65,14 +65,24 @@ async def ensure_index(collection_name: str, keys) -> None:
     await _db[collection_name].create_index(keys)
 
 
-def iter_documents(collection_name: str, query: Dict[str, Any], batch_size: int = 500):
+def iter_documents(collection_name: str, query: Dict[str, Any], batch_size: int = 500, sort=None):
     """
     Return a cursor over every document matching `query`, fetched from Mongo
     in batches of `batch_size` rather than being loaded all at once, so large
     result sets (e.g. "everything due right now" across many users) don't
-    spike memory - iterate it with `async for doc in cursor`.
+    spike memory - iterate it with `async for doc in cursor`. `sort` is
+    whatever cursor.sort() accepts, e.g. [("event_time_utc", 1)].
     """
-    return _db[collection_name].find(query).batch_size(batch_size)
+    cursor = _db[collection_name].find(query)
+    if sort:
+        cursor = cursor.sort(sort)
+    return cursor.batch_size(batch_size)
+
+
+async def delete_documents(collection_name: str, query: Dict[str, Any]) -> int:
+    """Delete every document matching `query`. Returns how many were deleted."""
+    result = await _db[collection_name].delete_many(query)
+    return result.deleted_count
 
 
 async def bulk_set(collection_name: str, ids: List[Any], update: Dict[str, Any]) -> None:

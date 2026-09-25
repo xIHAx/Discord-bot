@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import db
+from cogs.calendar import events_text, parse_time_of_day
 
 # yfinance logs every unknown ticker at ERROR level; we report those to the
 # user ourselves, so keep them out of the console.
@@ -24,9 +25,15 @@ COLLECTION = "crypto_watchlists"
 
 CHECK_INTERVAL_SECONDS = 60
 
-# Local hour (in the user's /settimezone offset, or UTC if they never set
-# one) at which the daily price DM goes out.
+# Default local time (in the user's /settimezone offset, or UTC if they never
+# set one) for the daily summary DM, until they pick one with /setremindertime.
 DAILY_SEND_HOUR = 9
+DAILY_SEND_MINUTE = 0
+
+# The summary lists events starting within this long after it's sent, up to
+# SUMMARY_MAX_EVENTS of them (a message's embeds share a 6000-character cap).
+SUMMARY_EVENTS_WINDOW = timedelta(hours=24)
+SUMMARY_MAX_EVENTS = 10
 
 # A Discord select menu holds at most 25 options, and /editlist shows each
 # list in one, so that's the cap per list. (An embed also maxes out at 25
@@ -51,15 +58,21 @@ SENTIMENT_BANDS = [
     (40, "🟠", 0xE67E22),   # Fear
     (60, "🟡", 0xF1C40F),   # Neutral
     (80, "🟢", 0x2ECC71),   # Greed
-    (101, "💚", 0x1E8449),  # Extreme greed
+    (101, "🔵", 0x1E8449),  # Extreme greed
 ]
 
 
-def next_daily_send(utc_offset: float, now: Optional[datetime] = None) -> datetime:
-    """The next DAILY_SEND_HOUR:00 in the given UTC offset, strictly after now, as a UTC datetime."""
+def send_time(doc: Optional[dict]) -> Tuple[int, int]:
+    """The (hour, minute) a user's daily summary goes out at, local time."""
+    doc = doc or {}
+    return doc.get("send_hour", DAILY_SEND_HOUR), doc.get("send_minute", DAILY_SEND_MINUTE)
+
+
+def next_daily_send(utc_offset: float, at: Tuple[int, int], now: Optional[datetime] = None) -> datetime:
+    """The next `at` (hour, minute) in the given UTC offset, strictly after now, as a UTC datetime."""
     tz = timezone(timedelta(hours=utc_offset))
     now_local = (now or datetime.now(timezone.utc)).astimezone(tz)
-    send_local = now_local.replace(hour=DAILY_SEND_HOUR, minute=0, second=0, microsecond=0)
+    send_local = now_local.replace(hour=at[0], minute=at[1], second=0, microsecond=0)
     if send_local <= now_local:
         send_local += timedelta(days=1)
     return send_local.astimezone(timezone.utc)
@@ -138,21 +151,39 @@ def stocks_embed(stocks: List[dict], quotes: Dict[str, dict]) -> discord.Embed:
     return embed
 
 
-def daily_embeds(
+def reminders_embed(events: List[dict]) -> discord.Embed:
+    embed = discord.Embed(
+        title="Your events in the next 24 hours",
+        description=events_text(events, SUMMARY_MAX_EVENTS, " - see /reminderlist") or "Nothing scheduled.",
+        colour=discord.Colour.purple(),
+    )
+    embed.set_footer(text="/setremindertime to change when this arrives · /togglenotif to stop these DMs")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+SUMMARY_HEADER = "## Your daily summary"
+
+
+def summary_embeds(
     coins: List[str],
     quotes: Dict[str, dict],
     sentiment: Optional[dict],
     stocks: List[dict],
     stock_quotes: Dict[str, dict],
+    events: List[dict],
 ) -> List[discord.Embed]:
-    """The daily price DM - also what /showlist sends on demand. One embed per non-empty list."""
+    """
+    The daily summary DM (sent with SUMMARY_HEADER as its text) - also what
+    /showlist sends on demand. Stocks first, then crypto (each only if that
+    list isn't empty), then the user's upcoming events at the bottom.
+    """
     embeds = []
-    if coins:
-        embeds.append(crypto_embed(coins, quotes, sentiment))
     if stocks:
         embeds.append(stocks_embed(stocks, stock_quotes))
-    if embeds:
-        embeds[-1].set_footer(text=f"{embeds[-1].footer.text} · /togglenotif to stop these DMs")
+    if coins:
+        embeds.append(crypto_embed(coins, quotes, sentiment))
+    embeds.append(reminders_embed(events))
     return embeds
 
 
@@ -306,7 +337,7 @@ class EditListView(discord.ui.View):
 # --- Cog ------------------------------------------------------------------
 
 class Crypto(commands.Cog):
-    """Per-user crypto and stock watchlists with a daily price DM."""
+    """Per-user crypto and stock watchlists, and the daily summary DM (prices plus upcoming events)."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -432,9 +463,26 @@ class Crypto(commands.Cog):
 
     # --------------------------------------------------------------- helpers
 
-    async def _utc_offset(self, user_id: int) -> float:
+    async def _utc_offset(self, user_id: int) -> Optional[float]:
+        """The user's /settimezone offset, or None if they haven't set one."""
         settings = await db.find_one("user_settings", {"user_id": user_id})
-        return settings["utc_offset"] if settings else 0
+        return settings["utc_offset"] if settings else None
+
+    async def _upcoming_events(self, user_ids: List[int], now: datetime) -> Dict[int, List[dict]]:
+        """{user_id: events starting within SUMMARY_EVENTS_WINDOW, soonest first} - one query for everyone."""
+        by_user = {user_id: [] for user_id in user_ids}
+        cursor = db.iter_documents(
+            "events",
+            {
+                "user_id": {"$in": user_ids},
+                "event_sent": False,
+                "event_time_utc": {"$gt": now, "$lte": now + SUMMARY_EVENTS_WINDOW},
+            },
+            sort=[("event_time_utc", 1)],
+        )
+        async for event in cursor:
+            by_user[event["user_id"]].append(event)
+        return by_user
 
     async def _save_list(self, user_id: int, doc: Optional[dict], field: str, items: list) -> str:
         """
@@ -448,15 +496,19 @@ class Crypto(commands.Cog):
                 "coins": [],
                 "stocks": [],
                 "notify": True,
-                "next_send_utc": next_daily_send(await self._utc_offset(user_id)),
+                "next_send_utc": next_daily_send(await self._utc_offset(user_id) or 0, send_time(None)),
             }
             new_doc[field] = items
             await db.insert_document(COLLECTION, new_doc)
-            return f"Daily price DMs are **on** ({DAILY_SEND_HOUR}:00 your time) - use /togglenotif to turn them off."
+            hour, minute = send_time(None)
+            return (
+                f"Daily summary DMs are **on** ({hour:02d}:{minute:02d} your time) - "
+                "use /setremindertime to change the time or /togglenotif to turn them off."
+            )
 
         await db.update_document(COLLECTION, {"user_id": user_id}, {field: items})
         if not doc.get("notify"):
-            return "Daily price DMs are currently **off** - use /togglenotif to turn them on."
+            return "Daily summary DMs are currently **off** - use /togglenotif to turn them on."
         return ""
 
     # ------------------------------------------------------------ commands
@@ -598,24 +650,28 @@ class Crypto(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="showlist", description="DM yourself your watchlist's current prices, like the daily message")
+    @app_commands.command(name="showlist", description="DM yourself your daily summary now: stock and crypto prices plus upcoming events")
     async def showlist(self, interaction: discord.Interaction):
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id}) or {}
         coins, stocks = doc.get("coins", []), doc.get("stocks", [])
+        now = datetime.now(timezone.utc)
+        events = (await self._upcoming_events([interaction.user.id], now))[interaction.user.id]
 
-        if not coins and not stocks:
+        if not coins and not stocks and not events:
             await interaction.response.send_message(
-                "Your watchlist is empty - add some with /addcoin or /addstock.", ephemeral=True
+                "Nothing to show - add to your watchlist with /addcoin or /addstock, "
+                "or create an event with /createevent.",
+                ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True)
 
         quotes, sentiment, stock_quotes = await self.fetch_market_data(coins, [s["symbol"] for s in stocks])
-        embeds = daily_embeds(coins, quotes or {}, sentiment, stocks, stock_quotes or {})
+        embeds = summary_embeds(coins, quotes or {}, sentiment, stocks, stock_quotes or {}, events)
 
         try:
-            await interaction.user.send(embeds=embeds)
+            await interaction.user.send(SUMMARY_HEADER, embeds=embeds)
         except discord.Forbidden:
             await interaction.followup.send(
                 "I couldn't DM you - allow direct messages from server members in your privacy settings and try again.",
@@ -623,7 +679,7 @@ class Crypto(commands.Cog):
             )
             return
 
-        text = "Sent your watchlist prices to your DMs."
+        text = "Sent your summary to your DMs."
         failed = [name for name, data, wanted in (
             ("CoinMarketCap", quotes, coins), ("Yahoo Finance", stock_quotes, stocks),
         ) if wanted and data is None]
@@ -631,27 +687,60 @@ class Crypto(commands.Cog):
             text += f"\nCouldn't reach {' or '.join(failed)}, so some prices are missing."
         await interaction.followup.send(text, ephemeral=True)
 
-    @app_commands.command(name="togglenotif", description="Turn your daily crypto and stock price DMs on or off")
+    @app_commands.command(name="togglenotif", description="Turn your daily summary DMs on or off")
     async def togglenotif(self, interaction: discord.Interaction):
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id})
         enable = not (doc or {}).get("notify", False)
 
         update = {"user_id": interaction.user.id, "notify": enable}
         if enable:
-            update["next_send_utc"] = next_daily_send(await self._utc_offset(interaction.user.id))
+            update["next_send_utc"] = next_daily_send(await self._utc_offset(interaction.user.id) or 0, send_time(doc))
         if doc is None:
             update["coins"] = []
             update["stocks"] = []
         await db.upsert_document(COLLECTION, {"user_id": interaction.user.id}, update)
 
         if not enable:
-            await interaction.response.send_message("Daily price DMs turned **off**.", ephemeral=True)
+            await interaction.response.send_message("Daily summary DMs turned **off**.", ephemeral=True)
             return
 
         ts = int(update["next_send_utc"].timestamp())
-        text = f"Daily price DMs turned **on**. Next one: <t:{ts}:F>."
-        if not (doc or {}).get("coins") and not (doc or {}).get("stocks"):
-            text += "\nYour watchlist is empty - add some with /addcoin or /addstock."
+        await interaction.response.send_message(
+            f"Daily summary DMs turned **on**. Next one: <t:{ts}:F>.", ephemeral=True
+        )
+
+    @app_commands.command(name="setremindertime", description="Set what time your daily summary DM arrives")
+    @app_commands.describe(time="24-hour time in your /settimezone timezone, e.g. 07:30")
+    async def setremindertime(self, interaction: discord.Interaction, time: str):
+        parsed = parse_time_of_day(time)
+        if parsed is None:
+            await interaction.response.send_message("Time must be 24-hour HH:MM, e.g. 07:30 or 18:00.", ephemeral=True)
+            return
+        hour, minute = parsed
+
+        user_id = interaction.user.id
+        doc = await db.find_one(COLLECTION, {"user_id": user_id})
+        offset = await self._utc_offset(user_id)
+        next_send = next_daily_send(offset or 0, parsed)
+
+        update = {"user_id": user_id, "send_hour": hour, "send_minute": minute}
+        if doc is None:
+            # Picking a time means they want the summary, so switch it on.
+            update.update({"coins": [], "stocks": [], "notify": True})
+        notify = doc is None or doc.get("notify")
+        if notify:
+            update["next_send_utc"] = next_send
+        await db.upsert_document(COLLECTION, {"user_id": user_id}, update)
+
+        text = f"Your daily summary will arrive at **{hour:02d}:{minute:02d}**"
+        if offset is None:
+            text += " UTC. Set your timezone with /settimezone to use your local time instead."
+        else:
+            text += " your time."
+        if notify:
+            text += f"\nNext one: <t:{int(next_send.timestamp())}:F>."
+        else:
+            text += "\nDaily summary DMs are currently **off** - use /togglenotif to turn them on."
         await interaction.response.send_message(text, ephemeral=True)
 
     # ------------------------------------------------------ background loop
@@ -703,17 +792,26 @@ class Crypto(commands.Cog):
         # Mark before sending: a crash in between means a missed DM, never a duplicate.
         await db.bulk_update(
             COLLECTION,
-            [(doc["_id"], {"next_send_utc": next_daily_send(offsets.get(doc["user_id"], 0), now)}) for doc in batch],
+            [
+                (doc["_id"], {"next_send_utc": next_daily_send(offsets.get(doc["user_id"], 0), send_time(doc), now)})
+                for doc in batch
+            ],
         )
 
+        events = await self._upcoming_events(user_ids, now)
         await asyncio.gather(
             *(
                 self._notify_bounded(
                     doc["user_id"],
-                    daily_embeds(doc.get("coins", []), quotes or {}, sentiment, doc.get("stocks", []), stock_quotes or {}),
+                    summary_embeds(
+                        doc.get("coins", []), quotes or {}, sentiment,
+                        doc.get("stocks", []), stock_quotes or {},
+                        events[doc["user_id"]],
+                    ),
                 )
                 for doc in batch
-                if doc.get("coins") or doc.get("stocks")
+                # Skip users with nothing at all to report.
+                if doc.get("coins") or doc.get("stocks") or events[doc["user_id"]]
             ),
             return_exceptions=True,
         )
@@ -729,7 +827,7 @@ class Crypto(commands.Cog):
             return
 
         try:
-            await user.send(embeds=embeds)
+            await user.send(SUMMARY_HEADER, embeds=embeds)
         except discord.Forbidden:
             pass
 
