@@ -151,18 +151,37 @@ def stocks_embed(stocks: List[dict], quotes: Dict[str, dict]) -> discord.Embed:
     return embed
 
 
-def reminders_embed(events: List[dict]) -> discord.Embed:
+SUMMARY_FOOTER = "/setremindertime to change when this arrives · /togglenotif to stop these DMs"
+
+
+def reminders_embed(events: List[dict], footer: str) -> discord.Embed:
     embed = discord.Embed(
         title="Your events in the next 24 hours",
         description=events_text(events, SUMMARY_MAX_EVENTS, " - see /reminderlist") or "Nothing scheduled.",
         colour=discord.Colour.purple(),
     )
-    embed.set_footer(text="/setremindertime to change when this arrives · /togglenotif to stop these DMs")
+    embed.set_footer(text=footer)
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
 SUMMARY_HEADER = "## Your daily summary"
+
+
+def price_embeds(
+    coins: List[str],
+    quotes: Dict[str, dict],
+    sentiment: Optional[dict],
+    stocks: List[dict],
+    stock_quotes: Dict[str, dict],
+) -> List[discord.Embed]:
+    """Stocks, then crypto - each only if that list isn't empty. What /showlist sends."""
+    embeds = []
+    if stocks:
+        embeds.append(stocks_embed(stocks, stock_quotes))
+    if coins:
+        embeds.append(crypto_embed(coins, quotes, sentiment))
+    return embeds
 
 
 def summary_embeds(
@@ -173,18 +192,8 @@ def summary_embeds(
     stock_quotes: Dict[str, dict],
     events: List[dict],
 ) -> List[discord.Embed]:
-    """
-    The daily summary DM (sent with SUMMARY_HEADER as its text) - also what
-    /showlist sends on demand. Stocks first, then crypto (each only if that
-    list isn't empty), then the user's upcoming events at the bottom.
-    """
-    embeds = []
-    if stocks:
-        embeds.append(stocks_embed(stocks, stock_quotes))
-    if coins:
-        embeds.append(crypto_embed(coins, quotes, sentiment))
-    embeds.append(reminders_embed(events))
-    return embeds
+    """The daily summary DM (sent with SUMMARY_HEADER as its text): the price embeds, then the user's upcoming events at the bottom."""
+    return price_embeds(coins, quotes, sentiment, stocks, stock_quotes) + [reminders_embed(events, SUMMARY_FOOTER)]
 
 
 def add_report(
@@ -650,42 +659,57 @@ class Crypto(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="showlist", description="DM yourself your daily summary now: stock and crypto prices plus upcoming events")
+    async def _dm_followup(self, interaction: discord.Interaction, embeds: List[discord.Embed]) -> bool:
+        """DM the embeds to the command's user. On closed DMs, explain via followup and return False."""
+        try:
+            await interaction.user.send(embeds=embeds)
+            return True
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I couldn't DM you - allow direct messages from server members in your privacy settings and try again.",
+                ephemeral=True,
+            )
+            return False
+
+    @app_commands.command(name="showlist", description="DM yourself the current prices of your watchlist's stocks and crypto")
     async def showlist(self, interaction: discord.Interaction):
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id}) or {}
         coins, stocks = doc.get("coins", []), doc.get("stocks", [])
-        now = datetime.now(timezone.utc)
-        events = (await self._upcoming_events([interaction.user.id], now))[interaction.user.id]
 
-        if not coins and not stocks and not events:
+        if not coins and not stocks:
             await interaction.response.send_message(
-                "Nothing to show - add to your watchlist with /addcoin or /addstock, "
-                "or create an event with /createevent.",
-                ephemeral=True,
+                "Your watchlist is empty - add some with /addcoin or /addstock.", ephemeral=True
             )
             return
 
         await interaction.response.defer(ephemeral=True)
 
         quotes, sentiment, stock_quotes = await self.fetch_market_data(coins, [s["symbol"] for s in stocks])
-        embeds = summary_embeds(coins, quotes or {}, sentiment, stocks, stock_quotes or {}, events)
-
-        try:
-            await interaction.user.send(SUMMARY_HEADER, embeds=embeds)
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "I couldn't DM you - allow direct messages from server members in your privacy settings and try again.",
-                ephemeral=True,
-            )
+        if not await self._dm_followup(interaction, price_embeds(coins, quotes or {}, sentiment, stocks, stock_quotes or {})):
             return
 
-        text = "Sent your summary to your DMs."
+        text = "Sent your watchlist prices to your DMs."
         failed = [name for name, data, wanted in (
             ("CoinMarketCap", quotes, coins), ("Yahoo Finance", stock_quotes, stocks),
         ) if wanted and data is None]
         if failed:
             text += f"\nCouldn't reach {' or '.join(failed)}, so some prices are missing."
         await interaction.followup.send(text, ephemeral=True)
+
+    @app_commands.command(name="showreminders", description="DM yourself your events for the next 24 hours, like the daily summary")
+    async def showreminders(self, interaction: discord.Interaction):
+        now = datetime.now(timezone.utc)
+        events = (await self._upcoming_events([interaction.user.id], now))[interaction.user.id]
+        if not events:
+            await interaction.response.send_message(
+                "You have no events in the next 24 hours. See /reminderlist for everything upcoming.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        embed = reminders_embed(events, "/reminderlist for all your upcoming events")
+        if await self._dm_followup(interaction, [embed]):
+            await interaction.followup.send("Sent your upcoming events to your DMs.", ephemeral=True)
 
     @app_commands.command(name="togglenotif", description="Turn your daily summary DMs on or off")
     async def togglenotif(self, interaction: discord.Interaction):
