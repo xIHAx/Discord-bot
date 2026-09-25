@@ -12,10 +12,6 @@ TEST_GUILD = discord.Object(id=int(os.getenv('TEST_GUILD_ID')))
 # Every cog module listed here gets loaded on startup.
 # Add a new entry whenever you create a new file in cogs/.
 INITIAL_EXTENSIONS = [
-    "cogs.general",
-    "cogs.ui",
-    "cogs.voice",
-    "cogs.data",
     "cogs.calendar",
     "cogs.crypto",
 ]
