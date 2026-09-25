@@ -179,24 +179,26 @@ class Crypto(commands.Cog):
 
     # ------------------------------------------------------------ commands
 
-    @app_commands.command(name="addcoin", description="Add a cryptocurrency to your daily price watchlist")
-    @app_commands.describe(ticker="The coin's ticker symbol, e.g. BTC, ETH, SOL")
-    async def addcoin(self, interaction: discord.Interaction, ticker: str):
-        symbol = ticker.strip().upper().lstrip("$")
-        if not SYMBOL_RE.match(symbol):
-            await interaction.response.send_message(
-                "That doesn't look like a ticker symbol - use letters/numbers only, e.g. BTC.",
-                ephemeral=True,
-            )
+    @app_commands.command(name="addcoin", description="Add cryptocurrencies to your daily price watchlist")
+    @app_commands.describe(tickers="One or more ticker symbols separated by commas, e.g. BTC, ETH, SOL")
+    async def addcoin(self, interaction: discord.Interaction, tickers: str):
+        # Normalise and de-duplicate, keeping the order the user typed them in.
+        symbols = list(dict.fromkeys(
+            t.strip().upper().lstrip("$") for t in tickers.split(",") if t.strip().lstrip("$")
+        ))
+        if not symbols:
+            await interaction.response.send_message("Give at least one ticker symbol, e.g. BTC or BTC, ETH.", ephemeral=True)
             return
 
         doc = await db.find_one(COLLECTION, {"user_id": interaction.user.id})
         coins = doc.get("coins", []) if doc else []
 
-        if symbol in coins:
-            await interaction.response.send_message(f"You're already tracking **{symbol}**.", ephemeral=True)
-            return
-        if len(coins) >= MAX_COINS:
+        malformed = [s for s in symbols if not SYMBOL_RE.match(s)]
+        already = [s for s in symbols if s in coins]
+        to_check = [s for s in symbols if s not in malformed and s not in already]
+
+        room = MAX_COINS - len(coins)
+        if to_check and room <= 0:
             await interaction.response.send_message(
                 f"You can track at most {MAX_COINS} coins. Remove some with /editlist first.",
                 ephemeral=True,
@@ -206,39 +208,63 @@ class Crypto(commands.Cog):
         # The API call can take a moment - defer so the interaction doesn't time out.
         await interaction.response.defer(ephemeral=True)
 
-        try:
-            quotes = await self.fetch_quotes([symbol])
-        except CoinMarketCapError as e:
-            print(f"CoinMarketCap lookup for {symbol} failed: {e}")
-            await interaction.followup.send("Couldn't reach CoinMarketCap right now - try again later.", ephemeral=True)
-            return
+        added, unknown, no_room = [], [], []
+        if to_check:
+            try:
+                # One request for the whole list (CMC charges per 100 symbols, not per symbol).
+                quotes = await self.fetch_quotes(to_check)
+            except CoinMarketCapError as e:
+                print(f"CoinMarketCap lookup for {to_check} failed: {e}")
+                await interaction.followup.send("Couldn't reach CoinMarketCap right now - try again later.", ephemeral=True)
+                return
 
-        coin = quotes.get(symbol)
-        if coin is None:
-            await interaction.followup.send(f"CoinMarketCap doesn't know a coin with ticker **{symbol}**.", ephemeral=True)
-            return
+            for symbol in to_check:
+                coin = quotes.get(symbol)
+                if coin is None:
+                    unknown.append(symbol)
+                elif len(added) >= room:
+                    no_room.append(symbol)
+                else:
+                    added.append((symbol, coin))
 
-        coins.append(symbol)
-        if doc is None:
-            # First coin: turn the daily DM on by default.
-            settings = await db.find_one("user_settings", {"user_id": interaction.user.id})
-            offset = settings["utc_offset"] if settings else 0
-            await db.insert_document(COLLECTION, {
-                "user_id": interaction.user.id,
-                "coins": coins,
-                "notify": True,
-                "next_send_utc": next_daily_send(offset),
-            })
-            notif_note = f"\nDaily price DMs are **on** ({DAILY_SEND_HOUR}:00 your time) - use /togglenotif to turn them off."
-        else:
-            await db.update_document(COLLECTION, {"user_id": interaction.user.id}, {"coins": coins})
-            notif_note = "" if doc.get("notify") else "\nDaily price DMs are currently **off** - use /togglenotif to turn them on."
+        notif_note = ""
+        if added:
+            coins.extend(symbol for symbol, _ in added)
+            if doc is None:
+                # First coins: turn the daily DM on by default.
+                settings = await db.find_one("user_settings", {"user_id": interaction.user.id})
+                offset = settings["utc_offset"] if settings else 0
+                await db.insert_document(COLLECTION, {
+                    "user_id": interaction.user.id,
+                    "coins": coins,
+                    "notify": True,
+                    "next_send_utc": next_daily_send(offset),
+                })
+                notif_note = f"Daily price DMs are **on** ({DAILY_SEND_HOUR}:00 your time) - use /togglenotif to turn them off."
+            else:
+                await db.update_document(COLLECTION, {"user_id": interaction.user.id}, {"coins": coins})
+                if not doc.get("notify"):
+                    notif_note = "Daily price DMs are currently **off** - use /togglenotif to turn them on."
 
-        price = coin["quote"]["USD"]["price"]
-        await interaction.followup.send(
-            f"Added **{symbol}** ({coin['name']}), currently {format_price(price)}.{notif_note}",
-            ephemeral=True,
-        )
+        lines = []
+        if added:
+            lines.append("**Added:**")
+            lines += [
+                f"- **{symbol}** ({coin['name']}), currently {format_price(coin['quote']['USD']['price'])}"
+                for symbol, coin in added
+            ]
+        if already:
+            lines.append(f"Already tracking: {', '.join(already)}")
+        if unknown:
+            lines.append(f"CoinMarketCap doesn't know: {', '.join(unknown)}")
+        if malformed:
+            lines.append(f"Not valid ticker symbols (letters/numbers only): {', '.join(malformed)}")
+        if no_room:
+            lines.append(f"Not added, watchlist is full ({MAX_COINS} max): {', '.join(no_room)}")
+        if notif_note:
+            lines.append(notif_note)
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @app_commands.command(name="editlist", description="Remove coins from your crypto watchlist")
     async def editlist(self, interaction: discord.Interaction):
