@@ -48,7 +48,7 @@ class Client(commands.Bot):
         # there, which ignores signals it has no handler for - so without
         # this it would hang until SIGKILL instead of disconnecting cleanly.
         try:
-            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(self.close()))
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, self._on_sigterm)
         except (NotImplementedError, RuntimeError):
             pass  # Windows doesn't support add_signal_handler; not needed locally.
 
@@ -59,11 +59,27 @@ class Client(commands.Bot):
         # place to load extensions (discord.py docs call this out
         # specifically).
         for extension in INITIAL_EXTENSIONS:
-            await self.load_extension(extension)
+            try:
+                await self.load_extension(extension)
+            except commands.ExtensionFailed:
+                if self.is_closed():
+                    # Stopped mid-startup (see _on_sigterm), which closed the
+                    # database under the cog that was loading. Not a real
+                    # failure - just stop quietly instead of crashing.
+                    return
+                raise
 
         # Here rather than on_ready, which fires again on every reconnect -
         # no need to re-register commands each time (Discord rate-limits it).
-        await self._sync_commands()
+        if not self.is_closed():
+            await self._sync_commands()
+
+    def _on_sigterm(self):
+        # Logged so shutdowns are easy to spot in Cloud Run's logs. If these
+        # show up without you deploying, Cloud Run is scaling the bot down -
+        # check minimum instances is 1 and billing is instance-based.
+        print("Received SIGTERM - Cloud Run is stopping this instance. Shutting down.")
+        asyncio.create_task(self.close())
 
     async def _sync_commands(self):
         if COMMAND_SYNC == "guild":
